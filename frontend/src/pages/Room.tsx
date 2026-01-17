@@ -32,7 +32,7 @@ export default function Room() {
 
   function getPrefs() {
     return JSON.parse(
-      localStorage.getItem("prefs") || '{"video":false,"audio":false}'
+      localStorage.getItem("prefs") || '{"video":false,"audio":false}',
     );
   }
   function savePrefs(video: boolean, audio: boolean) {
@@ -60,7 +60,7 @@ export default function Room() {
         });
 
         socket.current.emit("resumeConsumer", { consumerId: res.id });
-      }
+      },
     );
   }
 
@@ -139,16 +139,16 @@ export default function Room() {
             socket.current.emit(
               "connectTransport",
               { type: "send", dtlsParameters },
-              cb
+              cb,
             );
-          }
+          },
         );
 
         sendTransport.current.on(
           "produce",
           ({ kind, rtpParameters }: any, cb: any) => {
             socket.current.emit("produce", { kind, rtpParameters }, cb);
-          }
+          },
         );
 
         socket.current.emit("createTransport", { type: "recv" }, (p: any) => {
@@ -160,9 +160,9 @@ export default function Room() {
               socket.current.emit(
                 "connectTransport",
                 { type: "recv", dtlsParameters },
-                cb
+                cb,
               );
-            }
+            },
           );
 
           ready.current = true;
@@ -173,7 +173,7 @@ export default function Room() {
 
           socket.current.emit("getProducers", (list: any[]) => {
             list.forEach(({ producerId, peerId }) =>
-              consume(producerId, peerId)
+              consume(producerId, peerId),
             );
           });
 
@@ -210,7 +210,7 @@ export default function Room() {
   }, [roomId]);
 
   function refreshstream() {
-    console.log("refreshed")
+    console.log("refreshed");
     {
       Object.entries(peers).map(([id, stream]) => (
         <PeerVideo key={id} name={id} stream={stream} />
@@ -223,49 +223,33 @@ export default function Room() {
       <div style={{ marginBottom: 10 }}>
         <button
           onClick={toggleVideo}
-          style={{
-            marginRight: 10,
-            padding: "8px 16px",
-            background: videoOn ? "green" : "#333",
-            color: "#fff",
-            border: "none",
-          }}
+          className={`mr-3 px-4 py-2 text-white border-none ${videoOn ? "bg-[green]" : "bg-[#333]"} rounded-md`}
         >
           Video {videoOn ? "On" : "Off"}
         </button>
         <button
           onClick={toggleAudio}
-          style={{
-            padding: "8px 16px",
-            background: audioOn ? "green" : "#333",
-            color: "#fff",
-            border: "none",
-          }}
+          className={`
+            px-4 py-2 text-white border-none ${audioOn ? "bg-[green]" : "bg-[#333]"} rounded-md `}
         >
           Audio {audioOn ? "On" : "Off"}
         </button>
         <button
           onClick={refreshstream}
-          style={{
-            padding: "8px 16px",
-            background: "#454",
-            margin: "20px",
-            color: "#fff",
-            border: "none",
-          }}
+          className="px-4 py-2 rounded-md bg-[#454] m-5 text-white border-none"
         >
           Refresh
         </button>
       </div>
 
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+      <div className=" flex flex-wrap gap-3">
         <div>
           <video
             ref={myVideo}
             autoPlay
             muted
             playsInline
-            style={{ width: 320, height: 240, background: "#000" }}
+            className="w-[320px] scale-x-[-1] h-[240px] bg-black"
           />
           <p>You</p>
         </div>
@@ -291,7 +275,7 @@ function PeerVideo({ name, stream }: { name: string; stream: MediaStream }) {
         ref={ref}
         autoPlay
         playsInline
-        style={{ width: 320, height: 240, background: "#000" }}
+        className="w-[320px] scale-x-[-1] h-[240px] bg-black"
       />
       <p>{name}</p>
     </div>
