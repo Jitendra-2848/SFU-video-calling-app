@@ -1,7 +1,8 @@
 import express from "express";
 import { createServer } from "http";
 import { Server } from "socket.io";
-import { createWorker } from "mediasoup";
+import { config } from "../mediasoup/config";
+import { getWorker } from "../mediasoup/worker";
 
 const app = express();
 const server = createServer(app);
@@ -10,59 +11,142 @@ const io = new Server(server, { cors: { origin: "*" } });
 let router: any;
 const peers = new Map<string, any>();
 
-(async () => {
-  const worker = await createWorker();
-  router = await worker.createRouter({
-    mediaCodecs: [
-      { kind: "audio", mimeType: "audio/opus", clockRate: 48000, channels: 2 },
-      { kind: "video", mimeType: "video/VP8", clockRate: 90000 },
-    ],
+export const initMediasoup = async () => {
+  try {
+    const worker = getWorker();
+    router = await worker.createRouter({
+      mediaCodecs: config.mediasoup.router.mediaCodecs,
+    });
+    console.log("[MEDIASOUP] SFU Router initialized successfully");
+  } catch (err: any) {
+    console.error("[MEDIASOUP] Failed to initialize router:", err.message);
+  }
+};
+
+io.on("connection", (socket) => {
+  peers.set(socket.id, {
+    producers: new Map(),
+    consumers: new Map(),
+    room: null,
+    name: "Anonymous",
+    Email: "",
   });
-  console.log("Server ready");
-})();
 
-io.on("connection", (socket) => { 
-  peers.set(socket.id, { producers: new Map(), consumers: new Map() });
+  // Handle room join
+  socket.on("join", (payload: any) => {
+    // Support both { Room, Email, name } and { user: { Room, Email, name } }
+    const data = payload?.user || payload || {};
+    const Room = String(data.Room || data.room || "1");
+    const Email = data.Email || data.email || "";
+    const name = data.name || `User-${socket.id.slice(0, 5)}`;
 
-  socket.on("join", ({ Room,Email,name }) => {
-    const peer = peers.get(socket.id)
+    const peer = peers.get(socket.id);
+    if (!peer) return;
+
     peer.room = Room;
     peer.Email = Email;
     peer.name = name;
+
     socket.join(Room);
-    socket.emit("routerCapabilities", router.rtpCapabilities);
+    console.log(`[JOIN] Peer ${name} (${socket.id}) joined Room ${Room}`);
+
+    if (router) {
+      socket.emit("routerCapabilities", router.rtpCapabilities);
+    } else {
+      console.warn("[WARN] Router capabilities requested before router ready");
+    }
+
+    // Notify room members
+    socket.to(Room).emit("peerJoined", { peerId: socket.id, name });
   });
 
+  // Create WebRtcTransport
   socket.on("createTransport", async ({ type }, cb) => {
-    const transport = await router.createWebRtcTransport({
-      listenIps: [{ ip: "0.0.0.0", announcedIp: "127.0.0.1" }],
-      enableUdp: true,
-      enableTcp: true,
-    });
-    peers.get(socket.id)[type + "Transport"] = transport;
-    cb({
-      id: transport.id,
-      iceParameters: transport.iceParameters,
-      iceCandidates: transport.iceCandidates,
-      dtlsParameters: transport.dtlsParameters,
-    });
+    if (typeof cb !== "function" || !router) return;
+
+    try {
+      const transport = await router.createWebRtcTransport({
+        listenIps: config.mediasoup.webRtcTransport.listenIps,
+        enableUdp: true,
+        enableTcp: true,
+        preferUdp: true,
+        initialAvailableOutgoingBitrate: config.mediasoup.webRtcTransport.initialAvailableOutgoingBitrate,
+      });
+
+      const peer = peers.get(socket.id);
+      if (peer) {
+        peer[type + "Transport"] = transport;
+      }
+
+      transport.on("dtlsstatechange", (dtlsState: string) => {
+        if (dtlsState === "closed" || dtlsState === "failed") {
+          transport.close();
+        }
+      });
+
+      cb({
+        id: transport.id,
+        iceParameters: transport.iceParameters,
+        iceCandidates: transport.iceCandidates,
+        dtlsParameters: transport.dtlsParameters,
+      });
+    } catch (err: any) {
+      console.error("[TRANSPORT ERROR]", err.message);
+      cb({ error: err.message });
+    }
   });
 
+  // Connect WebRtcTransport
   socket.on("connectTransport", async ({ type, dtlsParameters }, cb) => {
-    await peers.get(socket.id)[type + "Transport"].connect({ dtlsParameters });
-    cb();
-  });
-
-  socket.on("produce", async ({ kind, rtpParameters }, cb) => {
     const peer = peers.get(socket.id);
-    const producer = await peer.sendTransport.produce({ kind, rtpParameters });
-    peer.producers.set(producer.id, producer);
-    socket.to(peer.room).emit("newProducer", { producerId: producer.id, peerId: socket.id });
-    cb({ id: producer.id });
+    const transport = peer ? peer[type + "Transport"] : null;
+    if (transport) {
+      try {
+        await transport.connect({ dtlsParameters });
+        if (typeof cb === "function") cb({ connected: true });
+      } catch (err: any) {
+        if (typeof cb === "function") cb({ error: err.message });
+      }
+    } else {
+      if (typeof cb === "function") cb({ error: "Transport not found" });
+    }
   });
 
+  // Produce media track
+  socket.on("produce", async ({ kind, rtpParameters }, cb) => {
+    if (typeof cb !== "function") return;
+    const peer = peers.get(socket.id);
+    if (!peer || !peer.sendTransport) {
+      return cb({ error: "Send transport not found" });
+    }
+
+    try {
+      const producer = await peer.sendTransport.produce({ kind, rtpParameters });
+      peer.producers.set(producer.id, producer);
+
+      // Notify other peers in the same room
+      socket.to(peer.room).emit("newProducer", {
+        producerId: producer.id,
+        peerId: socket.id,
+        name: peer.name,
+        kind,
+      });
+
+      producer.on("transportclose", () => {
+        producer.close();
+      });
+
+      cb({ id: producer.id });
+    } catch (err: any) {
+      cb({ error: err.message });
+    }
+  });
+
+  // Close producer (e.g. mute video or audio)
   socket.on("closeProducer", ({ producerId }) => {
     const peer = peers.get(socket.id);
+    if (!peer) return;
+
     const producer = peer.producers.get(producerId);
     if (producer) {
       producer.close();
@@ -71,43 +155,82 @@ io.on("connection", (socket) => {
     }
   });
 
+  // Get active producers in the room
   socket.on("getProducers", (cb) => {
+    if (typeof cb !== "function") return;
     const peer = peers.get(socket.id);
+    if (!peer) return cb([]);
+
     const result: any[] = [];
     peers.forEach((p, id) => {
       if (id !== socket.id && p.room === peer.room) {
-        p.producers.forEach((_: any, producerId: string) => {
-          result.push({ producerId, peerId: id });
+        p.producers.forEach((prod: any, producerId: string) => {
+          if (!prod.closed) {
+            result.push({
+              producerId,
+              peerId: id,
+              name: p.name,
+              kind: prod.kind,
+            });
+          }
         });
       }
     });
     cb(result);
   });
 
+  // Consume media track
   socket.on("consume", async ({ producerId, rtpCapabilities }, cb) => {
+    if (typeof cb !== "function" || !router) return;
     const peer = peers.get(socket.id);
+    if (!peer || !peer.recvTransport) {
+      return cb({ error: "Recv transport not found" });
+    }
+
     if (!router.canConsume({ producerId, rtpCapabilities })) {
       return cb({ error: "Cannot consume" });
     }
-    const consumer = await peer.recvTransport.consume({
-      producerId,
-      rtpCapabilities,
-      paused: true,
-    });
-    peer.consumers.set(consumer.id, consumer);
-    cb({
-      id: consumer.id,
-      producerId,
-      kind: consumer.kind,
-      rtpParameters: consumer.rtpParameters,
-    }); 
+
+    try {
+      const consumer = await peer.recvTransport.consume({
+        producerId,
+        rtpCapabilities,
+        paused: true, // Started paused, client calls resumeConsumer
+      });
+
+      peer.consumers.set(consumer.id, consumer);
+
+      consumer.on("transportclose", () => {
+        peer.consumers.delete(consumer.id);
+      });
+
+      consumer.on("producerclose", () => {
+        peer.consumers.delete(consumer.id);
+        socket.emit("producerClosed", { producerId, consumerId: consumer.id });
+      });
+
+      cb({
+        id: consumer.id,
+        producerId,
+        kind: consumer.kind,
+        rtpParameters: consumer.rtpParameters,
+      });
+    } catch (err: any) {
+      cb({ error: err.message });
+    }
   });
 
-  socket.on("resumeConsumer", async ({ consumerId }) => {
-    const consumer = peers.get(socket.id).consumers.get(consumerId);
-    if (consumer) await consumer.resume();
+  // Resume paused consumer
+  socket.on("resumeConsumer", async ({ consumerId }, cb) => {
+    const peer = peers.get(socket.id);
+    const consumer = peer ? peer.consumers.get(consumerId) : null;
+    if (consumer) {
+      await consumer.resume();
+      if (typeof cb === "function") cb({ resumed: true });
+    }
   });
 
+  // Handle disconnect
   socket.on("disconnect", () => {
     const peer = peers.get(socket.id);
     if (peer) {
@@ -115,7 +238,11 @@ io.on("connection", (socket) => {
       peer.consumers.forEach((c: any) => c.close());
       peer.sendTransport?.close();
       peer.recvTransport?.close();
-      socket.to(peer.room).emit("peerLeft", { peerId: socket.id });
+
+      if (peer.room) {
+        socket.to(peer.room).emit("peerLeft", { peerId: socket.id, name: peer.name });
+      }
+      console.log(`[DISCONNECT] Peer ${peer.name} (${socket.id}) disconnected`);
     }
     peers.delete(socket.id);
   });

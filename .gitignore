@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+package-lock.json
+dist/
+
+# Env & logs
+.env
+*.log
+npm-debug.log*
+
+# New Proctoring Folder (isolated experimental project)
+new/
+
+# OS Files
+.DS_Store
+Thumbs.db
