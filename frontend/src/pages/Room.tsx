@@ -3,18 +3,21 @@ import { useNavigate, useParams } from "react-router-dom";
 import { io, Socket } from "socket.io-client";
 import { Device } from "mediasoup-client";
 import { store } from "../lib/store";
-import { Video, VideoOff, Mic, MicOff, Monitor, PhoneOff, Copy, Check, Users } from "lucide-react";
+import { toast } from "../lib/toastStore";
+import { Video, VideoOff, Mic, MicOff, Monitor, PhoneOff, Copy, Check, Users, UserCheck } from "lucide-react";
 
 interface PeerInfo {
   peerId: string;
   name: string;
   stream: MediaStream;
+  consumers?: Record<string, any>;
 }
 
 export default function Room() {
   const { id: roomId } = useParams();
   const navigate = useNavigate();
   const user = store((state) => state.user);
+  const setUser = store((state) => state.setUser);
   const clearUser = store((state) => state.clearUser);
 
   // States
@@ -22,8 +25,13 @@ export default function Room() {
   const [videoOn, setVideoOn] = useState(false);
   const [audioOn, setAudioOn] = useState(false);
   const [screenOn, setScreenOn] = useState(false);
-  const [connectionStatus, setConnectionStatus] = useState("Connecting to SFU...");
+  const [connectionStatus, setConnectionStatus] = useState("Connecting...");
   const [copied, setCopied] = useState(false);
+
+  // Modal State for Direct Link / Refresh prompt
+  const [showPromptModal, setShowPromptModal] = useState(false);
+  const [guestName, setGuestName] = useState("");
+  const [guestEmail, setGuestEmail] = useState("");
 
   // Refs
   const myVideo = useRef<HTMLVideoElement>(null);
@@ -34,13 +42,16 @@ export default function Room() {
   const producers = useRef<{ video?: any; audio?: any; screen?: any }>({});
   const localStream = useRef<MediaStream>(new MediaStream());
   const ready = useRef(false);
+  const consumedProducerIds = useRef<Set<string>>(new Set());
 
-  // Guard: Ensure user details exist
+  // Guard: Ensure user details exist for current room
   useEffect(() => {
-    if (!user?.Room || !user?.name) {
-      navigate("/");
+    if (!user || !user.name) {
+      setShowPromptModal(true);
+    } else if (roomId && Number(user.Room) !== Number(roomId)) {
+      setUser({ ...user, Room: Number(roomId) });
     }
-  }, [user, navigate]);
+  }, [user, roomId, setUser]);
 
   // Handle room joining & Mediasoup setup
   useEffect(() => {
@@ -48,16 +59,30 @@ export default function Room() {
 
     const s = io("http://localhost:3000", {
       transports: ["websocket", "polling"],
+      reconnection: true,
+      reconnectionAttempts: 10,
+      reconnectionDelay: 1000,
     });
     socket.current = s;
 
     s.on("connect", () => {
       setConnectionStatus("Connected");
+      toast.success("Connected", `Joined room #${roomId}`);
       s.emit("join", {
-        Room: user.Room,
+        Room: String(roomId),
         Email: user.Email,
         name: user.name,
       });
+    });
+
+    s.on("disconnect", (reason) => {
+      setConnectionStatus("Disconnected");
+      toast.warning("Connection Interrupted", `Disconnected (${reason}). Retrying...`);
+    });
+
+    s.on("connect_error", (err) => {
+      setConnectionStatus("Connection Error");
+      toast.error("Connection Error", "Server unreachable: " + err.message);
     });
 
     s.on("routerCapabilities", async (rtpCapabilities: any) => {
@@ -69,7 +94,9 @@ export default function Room() {
         // 1. Create SEND Transport
         s.emit("createTransport", { type: "send" }, (params: any) => {
           if (!params || params.error) {
-            setConnectionStatus("Send Transport Error: " + params?.error);
+            const errStr = params?.error || "Send transport failed";
+            setConnectionStatus("Transport Error");
+            toast.error("Transport Error", errStr);
             return;
           }
 
@@ -80,7 +107,11 @@ export default function Room() {
             ({ dtlsParameters }: any, cb: () => void, errback: (err: any) => void) => {
               s.emit("connectTransport", { type: "send", dtlsParameters }, (res: any) => {
                 if (res?.connected) cb();
-                else errback(new Error(res?.error || "Connect failed"));
+                else {
+                  const error = new Error(res?.error || "Send transport connection failed");
+                  toast.error("Transport Error", error.message);
+                  errback(error);
+                }
               });
             }
           );
@@ -89,8 +120,10 @@ export default function Room() {
             "produce",
             ({ kind, rtpParameters }: any, cb: (res: any) => void, errback: (err: any) => void) => {
               s.emit("produce", { kind, rtpParameters }, (res: any) => {
-                if (res?.error) errback(new Error(res.error));
-                else cb({ id: res.id });
+                if (res?.error) {
+                  toast.error("Publish Error", res.error);
+                  errback(new Error(res.error));
+                } else cb({ id: res.id });
               });
             }
           );
@@ -98,7 +131,9 @@ export default function Room() {
           // 2. Create RECV Transport
           s.emit("createTransport", { type: "recv" }, (recvParams: any) => {
             if (!recvParams || recvParams.error) {
-              setConnectionStatus("Recv Transport Error: " + recvParams?.error);
+              const errStr = recvParams?.error || "Recv transport failed";
+              setConnectionStatus("Transport Error");
+              toast.error("Transport Error", errStr);
               return;
             }
 
@@ -109,78 +144,124 @@ export default function Room() {
               ({ dtlsParameters }: any, cb: () => void, errback: (err: any) => void) => {
                 s.emit("connectTransport", { type: "recv", dtlsParameters }, (res: any) => {
                   if (res?.connected) cb();
-                  else errback(new Error(res?.error || "Connect failed"));
+                  else {
+                    const error = new Error(res?.error || "Recv transport connection failed");
+                    toast.error("Transport Error", error.message);
+                    errback(error);
+                  }
                 });
               }
             );
 
             ready.current = true;
-            setConnectionStatus("Room Ready");
+            setConnectionStatus("Ready");
 
-            // Listen for new producers in the room
             s.on("newProducer", ({ producerId, peerId, name }: any) => {
               consumeTrack(producerId, peerId, name);
             });
 
-            // Fetch existing producers
-            s.emit("getProducers", (producerList: any[]) => {
-              if (Array.isArray(producerList)) {
-                producerList.forEach(({ producerId, peerId, name }) => {
-                  consumeTrack(producerId, peerId, name);
-                });
-              }
+            s.on("peerJoined", ({ name }: { peerId: string; name: string }) => {
+              toast.info("Participant Joined", `${name} joined room #${roomId}`);
+              fetchAndConsumeProducers();
             });
+
+            fetchAndConsumeProducers();
           });
         });
       } catch (err: any) {
-        setConnectionStatus("Mediasoup Load Error: " + err.message);
+        setConnectionStatus("Device Error");
+        toast.error("Device Load Error", err.message);
       }
     });
 
-    // Handle closed producers
-    s.on("producerClosed", ({ peerId }: { producerId?: string; peerId?: string }) => {
-      if (peerId) {
-        setPeers((prev) => {
-          const updated = { ...prev };
-          if (updated[peerId] && updated[peerId].stream.getTracks().length <= 1) {
-            delete updated[peerId];
-          }
-          return updated;
-        });
+    s.on("producerClosed", ({ producerId, consumerId, peerId }: { producerId?: string; consumerId?: string; peerId?: string }) => {
+      if (producerId) {
+        consumedProducerIds.current.delete(producerId);
       }
-    });
-
-    // Handle peer disconnect
-    s.on("peerLeft", ({ peerId }: { peerId: string }) => {
       setPeers((prev) => {
         const updated = { ...prev };
-        delete updated[peerId];
+        let targetId = peerId;
+
+        if (!targetId && consumerId) {
+          targetId = Object.keys(updated).find(
+            (id) => updated[id].consumers && updated[id].consumers![consumerId]
+          );
+        }
+
+        if (targetId && updated[targetId]) {
+          const peerObj = updated[targetId];
+          if (consumerId && peerObj.consumers?.[consumerId]) {
+            try {
+              peerObj.consumers[consumerId].track.stop();
+            } catch {}
+            delete peerObj.consumers[consumerId];
+          }
+
+          const activeTracks = peerObj.stream.getTracks().filter((t) => t.readyState === "live");
+          if (activeTracks.length === 0) {
+            delete updated[targetId];
+          } else {
+            updated[targetId] = {
+              ...peerObj,
+              stream: new MediaStream(activeTracks),
+            };
+          }
+        }
         return updated;
       });
     });
 
-    // Cleanup on unmount
+    s.on("peerLeft", ({ peerId, name }: { peerId: string; name?: string }) => {
+      toast.info("Participant Left", `${name || "A participant"} left.`);
+      setPeers((prev) => {
+        const updated = { ...prev };
+        if (updated[peerId]) {
+          try {
+            updated[peerId].stream.getTracks().forEach((t) => t.stop());
+          } catch {}
+          delete updated[peerId];
+        }
+        return updated;
+      });
+    });
+
+    const fetchAndConsumeProducers = () => {
+      if (!s) return;
+      s.emit("getProducers", (producerList: any[]) => {
+        if (Array.isArray(producerList)) {
+          producerList.forEach(({ producerId, peerId, name }) => {
+            consumeTrack(producerId, peerId, name);
+          });
+        }
+      });
+    };
+
     return () => {
       if (localStream.current) {
         localStream.current.getTracks().forEach((t) => t.stop());
       }
       s.disconnect();
+      consumedProducerIds.current.clear();
     };
   }, [roomId, user]);
 
-  // Consume a media track from a remote peer
   const consumeTrack = async (producerId: string, peerId: string, peerName?: string) => {
     const s = socket.current;
     const d = device.current;
     const recv = recvTransport.current;
 
     if (!s || !d || !recv) return;
+    if (consumedProducerIds.current.has(producerId)) return;
+    consumedProducerIds.current.add(producerId);
 
     s.emit(
       "consume",
       { producerId, rtpCapabilities: d.rtpCapabilities },
       async (res: any) => {
-        if (!res || res.error) return;
+        if (!res || res.error) {
+          consumedProducerIds.current.delete(producerId);
+          return;
+        }
 
         try {
           const consumer = await recv.consume({
@@ -192,38 +273,43 @@ export default function Room() {
 
           setPeers((prev) => {
             const existing = prev[peerId];
-            const stream = existing ? existing.stream : new MediaStream();
+            const oldStream = existing?.stream;
 
-            // Replace track of same kind if exists
-            stream
-              .getTracks()
-              .filter((t) => t.kind === consumer.track.kind)
-              .forEach((t) => stream.removeTrack(t));
+            const remainingTracks = oldStream
+              ? oldStream.getTracks().filter((t) => t.kind !== consumer.track.kind && t.readyState === "live")
+              : [];
 
-            stream.addTrack(consumer.track);
+            const newTracks = [...remainingTracks, consumer.track];
+            const newStream = new MediaStream(newTracks);
 
             return {
               ...prev,
               [peerId]: {
                 peerId,
                 name: peerName || existing?.name || `Participant ${peerId.slice(0, 4)}`,
-                stream,
+                stream: newStream,
+                consumers: {
+                  ...(existing?.consumers || {}),
+                  [consumer.id]: consumer,
+                },
               },
             };
           });
 
-          // Resume consumer on server
           s.emit("resumeConsumer", { consumerId: res.id });
-        } catch (err) {
-          console.error("Failed to consume track:", err);
+        } catch (err: any) {
+          consumedProducerIds.current.delete(producerId);
+          toast.error("Media Error", err.message || "Failed to receive media track");
         }
       }
     );
   };
 
-  // Toggle Camera
   const toggleVideo = async () => {
-    if (!ready.current || !sendTransport.current) return;
+    if (!ready.current || !sendTransport.current) {
+      toast.warning("Room Status", "Media transport connecting...");
+      return;
+    }
 
     if (!videoOn) {
       try {
@@ -239,8 +325,9 @@ export default function Room() {
 
         producers.current.video = await sendTransport.current.produce({ track });
         setVideoOn(true);
+        toast.info("Video Active", "Camera turned on.");
       } catch (err: any) {
-        alert("Camera permission denied or camera unavailable: " + err.message);
+        toast.error("Camera Error", err.message || "Camera unavailable or permission denied");
       }
     } else {
       if (producers.current.video) {
@@ -256,12 +343,15 @@ export default function Room() {
         myVideo.current.srcObject = localStream.current;
       }
       setVideoOn(false);
+      toast.info("Video Off", "Camera turned off.");
     }
   };
 
-  // Toggle Microphone
   const toggleAudio = async () => {
-    if (!ready.current || !sendTransport.current) return;
+    if (!ready.current || !sendTransport.current) {
+      toast.warning("Room Status", "Media transport connecting...");
+      return;
+    }
 
     if (!audioOn) {
       try {
@@ -271,8 +361,9 @@ export default function Room() {
 
         producers.current.audio = await sendTransport.current.produce({ track });
         setAudioOn(true);
+        toast.info("Microphone Active", "Microphone unmuted.");
       } catch (err: any) {
-        alert("Microphone permission denied: " + err.message);
+        toast.error("Microphone Error", err.message || "Microphone permission denied");
       }
     } else {
       if (producers.current.audio) {
@@ -285,12 +376,15 @@ export default function Room() {
         localStream.current.removeTrack(t);
       });
       setAudioOn(false);
+      toast.info("Microphone Muted", "Microphone muted.");
     }
   };
 
-  // Toggle Screen Sharing
   const toggleScreen = async () => {
-    if (!ready.current || !sendTransport.current) return;
+    if (!ready.current || !sendTransport.current) {
+      toast.warning("Room Status", "Media transport connecting...");
+      return;
+    }
 
     if (!screenOn) {
       try {
@@ -304,12 +398,16 @@ export default function Room() {
             producers.current.screen.close();
             producers.current.screen = null;
           }
+          toast.info("Screen Share Stopped", "Stopped sharing screen.");
         };
 
         producers.current.screen = await sendTransport.current.produce({ track });
         setScreenOn(true);
+        toast.info("Screen Share Active", "Sharing screen.");
       } catch (err: any) {
-        console.warn("Screen share cancelled or error:", err);
+        if (err.name !== "NotAllowedError") {
+          toast.error("Screen Share Error", err.message || "Screen share failed");
+        }
       }
     } else {
       if (producers.current.screen) {
@@ -318,10 +416,10 @@ export default function Room() {
         producers.current.screen = null;
       }
       setScreenOn(false);
+      toast.info("Screen Share Stopped", "Stopped sharing screen.");
     }
   };
 
-  // Leave Room
   const handleLeave = () => {
     if (localStream.current) {
       localStream.current.getTracks().forEach((t) => t.stop());
@@ -333,45 +431,61 @@ export default function Room() {
     navigate("/");
   };
 
-  // Copy Room Link
   const handleCopyLink = () => {
     navigator.clipboard.writeText(window.location.href);
     setCopied(true);
+    toast.success("Copied", "Room link copied to clipboard.");
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const handleGuestSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!guestName.trim()) {
+      toast.error("Input Error", "Please enter your name.");
+      return;
+    }
+    if (!guestEmail.trim()) {
+      toast.error("Input Error", "Please enter your email.");
+      return;
+    }
+    const newDetails = {
+      name: guestName.trim(),
+      Email: guestEmail.trim(),
+      Room: Number(roomId || 101),
+    };
+    setUser(newDetails);
+    setShowPromptModal(false);
+  };
+
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col font-sans">
-      {/* Light Clean Top Header */}
-      <header className="h-16 bg-white border-b border-slate-200 px-6 flex items-center justify-between shadow-sm sticky top-0 z-30">
+    <div className="min-h-screen bg-slate-100 text-slate-900 flex flex-col font-sans">
+      {/* Top Header Navbar */}
+      <header className="h-14 bg-white border-b border-slate-200 px-6 flex items-center justify-between sticky top-0 z-30">
         <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-lg bg-emerald-500 flex items-center justify-center text-white font-bold text-sm shadow-sm">
-            <Video size={18} />
+          <div className="w-8 h-8 rounded-lg bg-[#393939] text-white flex items-center justify-center font-bold text-xs shadow-xs">
+            <Video size={16} />
           </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <h1 className="font-bold text-slate-800 text-base leading-tight">
-                Room #{roomId}
-              </h1>
-              <span className="inline-block w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-            </div>
-            <p className="text-xs text-slate-500">
+          <div className="flex items-center gap-3">
+            <h1 className="font-semibold text-slate-900 text-sm tracking-tight">
+              Room #{roomId}
+            </h1>
+            <span className="text-xs text-slate-500 border-l border-slate-200 pl-3">
               {connectionStatus} • {Object.keys(peers).length + 1} participant(s)
-            </p>
+            </span>
           </div>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2">
           <button
             onClick={handleCopyLink}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-md transition-colors"
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-white hover:bg-slate-100 text-slate-800 text-xs font-medium rounded-lg border border-slate-300 transition-colors shadow-xs cursor-pointer"
           >
             {copied ? <Check size={13} /> : <Copy size={13} />}
-            <span>{copied ? "Copied!" : "Copy Link"}</span>
+            <span>{copied ? "Copied" : "Copy Link"}</span>
           </button>
           <button
             onClick={handleLeave}
-            className="flex items-center gap-1.5 px-3.5 py-1.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold rounded-md shadow-sm transition-colors"
+            className="flex items-center gap-1.5 px-3.5 py-1.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold rounded-lg shadow-xs transition-colors cursor-pointer"
           >
             <PhoneOff size={13} />
             <span>Leave Call</span>
@@ -379,13 +493,13 @@ export default function Room() {
         </div>
       </header>
 
-      {/* Main Video Stage */}
-      <main className="flex-1 p-6 max-w-7xl w-full mx-auto flex flex-col justify-between">
+      {/* Main Stage */}
+      <main className="flex-1 p-6 max-w-6xl w-full mx-auto flex flex-col justify-between">
         {/* Video Grid */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5 items-start">
           {/* My Video Card */}
-          <div className="bg-white rounded-xl overflow-hidden border border-slate-200 shadow-sm relative group">
-            <div className="w-full aspect-video bg-slate-900 flex items-center justify-center relative overflow-hidden">
+          <div className="bg-[#2f332c] rounded-2xl overflow-hidden border border-slate-700/60 shadow-sm relative group">
+            <div className="w-full aspect-video flex items-center justify-center relative">
               <video
                 ref={myVideo}
                 autoPlay
@@ -394,15 +508,18 @@ export default function Room() {
                 className={`w-full h-full object-cover scale-x-[-1] ${videoOn ? "block" : "hidden"}`}
               />
               {!videoOn && (
-                <div className="flex flex-col items-center justify-center text-slate-400">
-                  <div className="w-16 h-16 rounded-full bg-slate-700 flex items-center justify-center text-white text-xl font-bold mb-2 shadow-inner">
+                <div className="flex flex-col items-center justify-center">
+                  <div className="w-16 h-16 rounded-2xl bg-[#636363] text-white flex items-center justify-center text-xl font-bold border border-slate-700 shadow-sm uppercase tracking-wider">
                     {user?.name ? user.name.charAt(0).toUpperCase() : "U"}
                   </div>
-                  <span className="text-xs font-medium">Camera Off</span>
+                  <div className="flex items-center gap-1.5 text-xs text-slate-300 font-medium bg-slate-800/90 px-3 py-1 rounded-full border border-slate-700 mt-2.5">
+                    <VideoOff size={13} />
+                    <span>Camera Off</span>
+                  </div>
                 </div>
               )}
-              {/* Bottom label */}
-              <div className="absolute bottom-2.5 left-2.5 bg-black/60 backdrop-blur-sm text-white px-2.5 py-1 rounded-md text-xs font-semibold flex items-center gap-1.5">
+              {/* Bottom Label Tag */}
+              <div className="absolute bottom-3 left-3 bg-slate-950/80 backdrop-blur-xs text-white px-2.5 py-1 rounded-lg text-xs font-medium flex items-center gap-2 border border-white/10">
                 <span>{user?.name || "You"} (You)</span>
                 {audioOn ? (
                   <Mic size={12} className="text-emerald-400" />
@@ -419,84 +536,130 @@ export default function Room() {
           ))}
         </div>
 
-        {/* Empty State Callout when alone in room */}
+        {/* Empty State when alone */}
         {Object.keys(peers).length === 0 && (
-          <div className="my-8 text-center bg-white border border-dashed border-slate-300 rounded-xl p-8 max-w-md mx-auto">
-            <Users size={32} className="mx-auto text-slate-400 mb-2" />
-            <h3 className="text-sm font-bold text-slate-700 mb-1">
-              You are the first person in this room!
+          <div className="my-10 text-center bg-white border border-slate-200 rounded-2xl p-8 max-w-sm mx-auto shadow-xs">
+            <div className="w-10 h-10 rounded-full bg-slate-100 flex items-center justify-center mx-auto text-slate-700 mb-2">
+              <Users size={20} />
+            </div>
+            <h3 className="text-xs font-bold text-slate-900 mb-1">
+              You are the only person in this room
             </h3>
-            <p className="text-xs text-slate-500 mb-4">
-              Share the room number or link with others so they can join your call.
+            <p className="text-[11px] text-slate-500 mb-4">
+              Share the invite link with others to start talking.
             </p>
             <button
               onClick={handleCopyLink}
-              className="flex items-center gap-1.5 mx-auto px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-bold rounded-md shadow-sm transition-colors"
+              className="flex items-center gap-1.5 mx-auto px-3.5 py-1.5 bg-slate-900 text-white hover:bg-black text-xs font-semibold rounded-lg shadow-xs cursor-pointer"
             >
-              {copied ? <Check size={14} /> : <Copy size={14} />}
-              <span>{copied ? "Link Copied!" : "Copy Invite Link"}</span>
+              {copied ? <Check size={13} /> : <Copy size={13} />}
+              <span>{copied ? "Link Copied" : "Copy Invite Link"}</span>
             </button>
           </div>
         )}
 
-        {/* Bottom Floating Control Bar */}
-        <div className="sticky bottom-4 mx-auto mt-6 bg-white/95 backdrop-blur border border-slate-200 shadow-md rounded-2xl px-6 py-3 flex items-center gap-4">
-          {/* Camera Button */}
+        {/* Floating Bottom Control Toolbar */}
+        <div className="sticky bottom-4 mx-auto mt-6 bg-white border border-slate-200 shadow-md rounded-full px-5 py-2.5 flex items-center gap-3 z-20">
           <button
             onClick={toggleVideo}
-            className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold transition-all ${
-              videoOn
-                ? "bg-emerald-500 text-white hover:bg-emerald-600 shadow-sm"
-                : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+            className={`flex items-center gap-2 px-3.5 py-2 rounded-full text-xs font-medium transition-all cursor-pointer ${
+              videoOn ? "bg-slate-900 text-white shadow-xs" : "bg-slate-100 text-slate-800 hover:bg-slate-200 border border-slate-300"
             }`}
           >
-            {videoOn ? <VideoOff size={16} /> : <Video size={16} />}
+            {videoOn ? <VideoOff size={14} /> : <Video size={14} />}
             <span>{videoOn ? "Stop Video" : "Start Video"}</span>
           </button>
 
-          {/* Microphone Button */}
           <button
             onClick={toggleAudio}
-            className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold transition-all ${
-              audioOn
-                ? "bg-emerald-500 text-white hover:bg-emerald-600 shadow-sm"
-                : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+            className={`flex items-center gap-2 px-3.5 py-2 rounded-full text-xs font-medium transition-all cursor-pointer ${
+              audioOn ? "bg-slate-900 text-white shadow-xs" : "bg-slate-100 text-slate-800 hover:bg-slate-200 border border-slate-300"
             }`}
           >
-            {audioOn ? <MicOff size={16} /> : <Mic size={16} />}
+            {audioOn ? <MicOff size={14} /> : <Mic size={14} />}
             <span>{audioOn ? "Mute" : "Unmute"}</span>
           </button>
 
-          {/* Screen Share Button */}
           <button
             onClick={toggleScreen}
-            className={`flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold transition-all ${
-              screenOn
-                ? "bg-blue-600 text-white hover:bg-blue-700 shadow-sm"
-                : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+            className={`flex items-center gap-2 px-3.5 py-2 rounded-full text-xs font-medium transition-all cursor-pointer ${
+              screenOn ? "bg-slate-900 text-white shadow-xs" : "bg-slate-100 text-slate-800 hover:bg-slate-200 border border-slate-300"
             }`}
           >
-            <Monitor size={16} />
-            <span>{screenOn ? "Stop Sharing" : "Share Screen"}</span>
+            <Monitor size={14} />
+            <span>{screenOn ? "Stop Share" : "Share Screen"}</span>
           </button>
 
-          <div className="h-6 w-px bg-slate-200" />
+          <div className="h-5 w-px bg-slate-300 mx-1" />
 
-          {/* End Call Button */}
           <button
             onClick={handleLeave}
-            className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold bg-rose-50 text-rose-600 hover:bg-rose-600 hover:text-white transition-all"
+            className="flex items-center gap-1.5 px-4 py-2 rounded-full text-xs font-semibold bg-rose-600 text-white hover:bg-rose-700 transition-all cursor-pointer shadow-xs"
           >
-            <PhoneOff size={16} />
+            <PhoneOff size={14} />
             <span>End Call</span>
           </button>
         </div>
       </main>
+
+      {/* Guest Registration Modal */}
+      {showPromptModal && (
+        <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-2xl border border-slate-200 p-6 max-w-sm w-full shadow-xl">
+            <div className="flex items-center gap-2.5 mb-3">
+              <UserCheck size={18} className="text-slate-900" />
+              <h3 className="font-bold text-slate-900 text-sm">Join Room #{roomId}</h3>
+            </div>
+
+            <form onSubmit={handleGuestSubmit} className="space-y-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">Your Name</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="Enter name"
+                  value={guestName}
+                  onChange={(e) => setGuestName(e.target.value)}
+                  className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-slate-900/10 focus:border-slate-900"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700 mb-1">Your Email</label>
+                <input
+                  type="email"
+                  required
+                  placeholder="Enter email"
+                  value={guestEmail}
+                  onChange={(e) => setGuestEmail(e.target.value)}
+                  className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-slate-900/10 focus:border-slate-900"
+                />
+              </div>
+
+              <div className="flex gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => navigate("/")}
+                  className="flex-1 py-2 rounded-lg bg-slate-100 text-slate-800 border border-slate-300 text-xs font-medium hover:bg-slate-200"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="flex-1 py-2 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-black shadow-xs"
+                >
+                  Join Call
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-// Remote Peer Card Component
+// Remote Peer Video Card Component
 function PeerVideoCard({ name, stream }: { name: string; stream: MediaStream }) {
   const ref = useRef<HTMLVideoElement>(null);
   const [hasVideoTrack, setHasVideoTrack] = useState(false);
@@ -505,11 +668,11 @@ function PeerVideoCard({ name, stream }: { name: string; stream: MediaStream }) 
     if (ref.current && stream) {
       ref.current.srcObject = stream;
       const vTracks = stream.getVideoTracks();
-      setHasVideoTrack(vTracks.length > 0 && vTracks[0].enabled);
+      setHasVideoTrack(vTracks.length > 0 && vTracks[0].enabled && vTracks[0].readyState === "live");
 
       const handleTrackChange = () => {
         const vt = stream.getVideoTracks();
-        setHasVideoTrack(vt.length > 0 && vt[0].enabled);
+        setHasVideoTrack(vt.length > 0 && vt[0].enabled && vt[0].readyState === "live");
       };
 
       stream.addEventListener("addtrack", handleTrackChange);
@@ -523,8 +686,8 @@ function PeerVideoCard({ name, stream }: { name: string; stream: MediaStream }) 
   }, [stream]);
 
   return (
-    <div className="bg-white rounded-xl overflow-hidden border border-slate-200 shadow-sm relative group">
-      <div className="w-full aspect-video bg-slate-900 flex items-center justify-center relative overflow-hidden">
+    <div className="bg-[#2f332c] rounded-2xl overflow-hidden border border-slate-700/60 shadow-sm relative group">
+      <div className="w-full aspect-video flex items-center justify-center relative">
         <video
           ref={ref}
           autoPlay
@@ -532,14 +695,17 @@ function PeerVideoCard({ name, stream }: { name: string; stream: MediaStream }) 
           className={`w-full h-full object-cover scale-x-[-1] ${hasVideoTrack ? "block" : "hidden"}`}
         />
         {!hasVideoTrack && (
-          <div className="flex flex-col items-center justify-center text-slate-400">
-            <div className="w-16 h-16 rounded-full bg-emerald-700 flex items-center justify-center text-white text-xl font-bold mb-2 shadow-inner">
+          <div className="flex flex-col items-center justify-center">
+            <div className="w-16 h-16 rounded-2xl bg-[#636363] text-white flex items-center justify-center text-xl font-bold border border-slate-700 shadow-sm uppercase tracking-wider">
               {name ? name.charAt(0).toUpperCase() : "P"}
             </div>
-            <span className="text-xs font-medium">Camera Off</span>
+            <div className="flex items-center gap-1.5 text-xs text-slate-300 font-medium bg-slate-800/90 px-3 py-1 rounded-full border border-slate-700 mt-2.5">
+              <VideoOff size={13} />
+              <span>Camera Off</span>
+            </div>
           </div>
         )}
-        <div className="absolute bottom-2.5 left-2.5 bg-black/60 backdrop-blur-sm text-white px-2.5 py-1 rounded-md text-xs font-semibold">
+        <div className="absolute bottom-3 left-3 bg-slate-950/80 backdrop-blur-xs text-white px-2.5 py-1 rounded-lg text-xs font-medium border border-white/10">
           {name}
         </div>
       </div>

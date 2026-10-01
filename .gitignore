@@ -9,8 +9,8 @@ dist/
 npm-debug.log*
 
 # New Proctoring Folder (isolated experimental project)
-new/
-
+new
+new/*
 # OS Files
 .DS_Store
 Thumbs.db

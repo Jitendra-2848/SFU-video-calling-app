@@ -6,7 +6,12 @@ import { getWorker } from "../mediasoup/worker";
 
 const app = express();
 const server = createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
 
 let router: any;
 const peers = new Map<string, any>();
@@ -34,11 +39,10 @@ io.on("connection", (socket) => {
 
   // Handle room join
   socket.on("join", (payload: any) => {
-    // Support both { Room, Email, name } and { user: { Room, Email, name } }
     const data = payload?.user || payload || {};
     const Room = String(data.Room || data.room || "1");
     const Email = data.Email || data.email || "";
-    const name = data.name || `User-${socket.id.slice(0, 5)}`;
+    const name = data.name || `User-${socket.id.slice(0, 4)}`;
 
     const peer = peers.get(socket.id);
     if (!peer) return;
@@ -53,16 +57,35 @@ io.on("connection", (socket) => {
     if (router) {
       socket.emit("routerCapabilities", router.rtpCapabilities);
     } else {
-      console.warn("[WARN] Router capabilities requested before router ready");
+      socket.emit("error", { message: "SFU Media Router not ready yet" });
     }
 
-    // Notify room members
+    // Notify other peers in the room
     socket.to(Room).emit("peerJoined", { peerId: socket.id, name });
+  });
+
+  // Get active peers in room
+  socket.on("getRoomPeers", (cb) => {
+    if (typeof cb !== "function") return;
+    const peer = peers.get(socket.id);
+    if (!peer || !peer.room) return cb([]);
+
+    const roomPeers: any[] = [];
+    peers.forEach((p, id) => {
+      if (id !== socket.id && p.room === peer.room) {
+        roomPeers.push({
+          peerId: id,
+          name: p.name,
+        });
+      }
+    });
+    cb(roomPeers);
   });
 
   // Create WebRtcTransport
   socket.on("createTransport", async ({ type }, cb) => {
-    if (typeof cb !== "function" || !router) return;
+    if (typeof cb !== "function") return;
+    if (!router) return cb({ error: "SFU Router not initialized" });
 
     try {
       const transport = await router.createWebRtcTransport({
@@ -80,6 +103,7 @@ io.on("connection", (socket) => {
 
       transport.on("dtlsstatechange", (dtlsState: string) => {
         if (dtlsState === "closed" || dtlsState === "failed") {
+          console.warn(`[TRANSPORT DTLS] Peer ${socket.id} ${type} transport DTLS state: ${dtlsState}`);
           transport.close();
         }
       });
@@ -92,7 +116,7 @@ io.on("connection", (socket) => {
       });
     } catch (err: any) {
       console.error("[TRANSPORT ERROR]", err.message);
-      cb({ error: err.message });
+      cb({ error: err.message || "Failed to create WebRTC transport" });
     }
   });
 
@@ -105,6 +129,7 @@ io.on("connection", (socket) => {
         await transport.connect({ dtlsParameters });
         if (typeof cb === "function") cb({ connected: true });
       } catch (err: any) {
+        console.error("[CONNECT TRANSPORT ERROR]", err.message);
         if (typeof cb === "function") cb({ error: err.message });
       }
     } else {
@@ -124,7 +149,12 @@ io.on("connection", (socket) => {
       const producer = await peer.sendTransport.produce({ kind, rtpParameters });
       peer.producers.set(producer.id, producer);
 
-      // Notify other peers in the same room
+      // Store metadata
+      producer.appData = { peerId: socket.id, kind, name: peer.name };
+
+      console.log(`[PRODUCE] Peer ${peer.name} (${socket.id}) produced ${kind} track (${producer.id})`);
+
+      // Notify other peers in the room
       socket.to(peer.room).emit("newProducer", {
         producerId: producer.id,
         peerId: socket.id,
@@ -133,11 +163,14 @@ io.on("connection", (socket) => {
       });
 
       producer.on("transportclose", () => {
+        console.log(`[PRODUCER CLOSE] Producer ${producer.id} transport closed`);
+        peer.producers.delete(producer.id);
         producer.close();
       });
 
       cb({ id: producer.id });
     } catch (err: any) {
+      console.error("[PRODUCE ERROR]", err.message);
       cb({ error: err.message });
     }
   });
@@ -149,9 +182,10 @@ io.on("connection", (socket) => {
 
     const producer = peer.producers.get(producerId);
     if (producer) {
+      console.log(`[CLOSE PRODUCER] Peer ${peer.name} (${socket.id}) closed producer ${producerId}`);
       producer.close();
       peer.producers.delete(producerId);
-      socket.to(peer.room).emit("producerClosed", { producerId, peerId: socket.id });
+      io.to(peer.room).emit("producerClosed", { producerId, peerId: socket.id });
     }
   });
 
@@ -159,7 +193,7 @@ io.on("connection", (socket) => {
   socket.on("getProducers", (cb) => {
     if (typeof cb !== "function") return;
     const peer = peers.get(socket.id);
-    if (!peer) return cb([]);
+    if (!peer || !peer.room) return cb([]);
 
     const result: any[] = [];
     peers.forEach((p, id) => {
@@ -181,14 +215,16 @@ io.on("connection", (socket) => {
 
   // Consume media track
   socket.on("consume", async ({ producerId, rtpCapabilities }, cb) => {
-    if (typeof cb !== "function" || !router) return;
+    if (typeof cb !== "function") return;
+    if (!router) return cb({ error: "SFU Router not initialized" });
+
     const peer = peers.get(socket.id);
     if (!peer || !peer.recvTransport) {
       return cb({ error: "Recv transport not found" });
     }
 
     if (!router.canConsume({ producerId, rtpCapabilities })) {
-      return cb({ error: "Cannot consume" });
+      return cb({ error: "Router cannot consume this producer" });
     }
 
     try {
@@ -200,13 +236,21 @@ io.on("connection", (socket) => {
 
       peer.consumers.set(consumer.id, consumer);
 
+      // Identify producer owner peerId
+      let producerPeerId = "";
+      peers.forEach((p, id) => {
+        if (p.producers.has(producerId)) {
+          producerPeerId = id;
+        }
+      });
+
       consumer.on("transportclose", () => {
         peer.consumers.delete(consumer.id);
       });
 
       consumer.on("producerclose", () => {
         peer.consumers.delete(consumer.id);
-        socket.emit("producerClosed", { producerId, consumerId: consumer.id });
+        socket.emit("producerClosed", { producerId, consumerId: consumer.id, peerId: producerPeerId });
       });
 
       cb({
@@ -216,6 +260,7 @@ io.on("connection", (socket) => {
         rtpParameters: consumer.rtpParameters,
       });
     } catch (err: any) {
+      console.error("[CONSUME ERROR]", err.message);
       cb({ error: err.message });
     }
   });
@@ -225,8 +270,14 @@ io.on("connection", (socket) => {
     const peer = peers.get(socket.id);
     const consumer = peer ? peer.consumers.get(consumerId) : null;
     if (consumer) {
-      await consumer.resume();
-      if (typeof cb === "function") cb({ resumed: true });
+      try {
+        await consumer.resume();
+        if (typeof cb === "function") cb({ resumed: true });
+      } catch (err: any) {
+        if (typeof cb === "function") cb({ error: err.message });
+      }
+    } else {
+      if (typeof cb === "function") cb({ error: "Consumer not found" });
     }
   });
 
@@ -240,7 +291,7 @@ io.on("connection", (socket) => {
       peer.recvTransport?.close();
 
       if (peer.room) {
-        socket.to(peer.room).emit("peerLeft", { peerId: socket.id, name: peer.name });
+        io.to(peer.room).emit("peerLeft", { peerId: socket.id, name: peer.name });
       }
       console.log(`[DISCONNECT] Peer ${peer.name} (${socket.id}) disconnected`);
     }
